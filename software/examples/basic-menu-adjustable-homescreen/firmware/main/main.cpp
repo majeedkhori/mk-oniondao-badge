@@ -161,6 +161,9 @@ enum AppState {
     STATE_ESPNOW_TARGET,
     STATE_ATECC_INTRO,  // first-time identity setup — show intro, wait for SELECT
     STATE_ATECC_DONE,   // provisioning complete — show result, any button → ESPNow
+    STATE_TTT,          // tic tac toe
+    STATE_ID_CARD,      // badge ID card view
+    STATE_ID_EDIT,      // handle editor
 };
 
 static AppState g_state        = STATE_MENU;
@@ -170,11 +173,26 @@ static uint8_t  g_last_btns    = 0;
 static int      g_sysinfo_page = 0;   // 0=hardware 1=RNG
 static uint8_t  g_sysinfo_rng[16] = {};
 
-#define MENU_COUNT 2
+#define MENU_COUNT 4
 static const char* MENU_LABELS[MENU_COUNT] = {
     "1. System Info",
     "2. ESPNow Beacon",
+    "3. Tic Tac Toe",
+    "4. ID Card",
 };
+
+// ── ID Card state ─────────────────────────────────────────────────────────────
+static char g_handle[16]       = {};   // persisted in Preferences key "handle"
+static int  g_id_edit_pos      = 0;   // cursor position in handle string
+static int  g_id_edit_char_idx = 0;   // index into EDIT_CHARSET
+
+// ── Tic Tac Toe state ─────────────────────────────────────────────────────────
+// board[0..8]: 0=empty, 1=X, 2=O; cells numbered left-to-right, top-to-bottom
+static uint8_t g_ttt_board[9]  = {};
+static int     g_ttt_cursor    = 0;  // selected cell (0–8)
+static int     g_ttt_turn      = 1;  // 1=X, 2=O
+static int     g_ttt_winner    = 0;  // 0=ongoing, 1=X wins, 2=O wins, 3=draw
+static int     g_ttt_partial   = 0;
 
 // ── Button IRQ ────────────────────────────────────────────────────────────────
 
@@ -690,7 +708,8 @@ static void add_ping_peer(const uint8_t* mac) {
         Serial.printf("[espnow] add_ping_peer failed: %d (table full?)\n", err);
 }
 
-static void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
+static void on_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+    const uint8_t* mac = info->src_addr;
     if ((size_t)len == sizeof(BeaconMsg)) {
         BeaconMsg msg;
         memcpy(&msg, data, sizeof(BeaconMsg));
@@ -805,12 +824,12 @@ static void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
         }
 
         g_recv_flag = true;
-        Serial.printf("[espnow] recv %s from %s (%02X:%02X:%02X:%02X:%02X:%02X) #%u\n",
+        Serial.printf("[espnow] recv %s from %s (%02X:%02X:%02X:%02X:%02X:%02X) #%lu\n",
             msg.type == MSG_PING ? "PING" : msg.type == MSG_PONG ? "PONG" :
             msg.type == MSG_TEXT ? "TEXT" :
             msg.type == MSG_CHALLENGE ? "CHAL" :
             msg.type == MSG_CAP_TOKEN ? "CAP" : "BCN",
-            msg.name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], msg.counter);
+            msg.name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned long)msg.counter);
     }
 }
 
@@ -835,8 +854,8 @@ static void send_beacon() {
 
     uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_now_send(broadcast, (uint8_t*)&msg, sizeof(msg));
-    Serial.printf("[espnow] sent beacon #%u as %s%s\n",
-        msg.counter, g_callsign, g_atecc_ok ? " [signed]" : "");
+    Serial.printf("[espnow] sent beacon #%lu as %s%s\n",
+        (unsigned long)msg.counter, g_callsign, g_atecc_ok ? " [signed]" : "");
 }
 
 static void shutdown_espnow() {
@@ -956,7 +975,7 @@ static void draw_espnow_beacon() {
         display.setCursor(8, 52);
         display.print(buf);
 
-        snprintf(buf, sizeof(buf), "Sent: %-4u  Peers: %d", g_send_count, g_peer_count);
+        snprintf(buf, sizeof(buf), "Sent: %-4lu  Peers: %d", (unsigned long)g_send_count, g_peer_count);
         display.setCursor(8, 68);
         display.print(buf);
 
@@ -1307,6 +1326,230 @@ static void draw_espnow() {
     }
 }
 
+// ── Tic Tac Toe ───────────────────────────────────────────────────────────────
+
+static int ttt_check_winner() {
+    const int lines[8][3] = {
+        {0,1,2},{3,4,5},{6,7,8},  // rows
+        {0,3,6},{1,4,7},{2,5,8},  // cols
+        {0,4,8},{2,4,6}           // diagonals
+    };
+    for (auto& l : lines) {
+        if (g_ttt_board[l[0]] && g_ttt_board[l[0]] == g_ttt_board[l[1]]
+                               && g_ttt_board[l[0]] == g_ttt_board[l[2]])
+            return g_ttt_board[l[0]];
+    }
+    for (int i = 0; i < 9; i++) if (!g_ttt_board[i]) return 0;
+    return 3; // draw
+}
+
+static void ttt_reset() {
+    memset(g_ttt_board, 0, sizeof(g_ttt_board));
+    g_ttt_cursor  = 0;
+    g_ttt_turn    = 1;
+    g_ttt_winner  = 0;
+    g_ttt_partial = 0;
+}
+
+static void draw_ttt() {
+    // Cell layout: 3 columns x 3 rows, centred in the content area
+    // Display: 264 x 176. Header ~30px, footer ~26px, content ~120px.
+    const int CELL_W = 60, CELL_H = 36;
+    const int GRID_W = CELL_W * 3, GRID_H = CELL_H * 3;
+    const int OX = (264 - GRID_W) / 2;  // 22
+    const int OY = 32;
+
+    if (++g_ttt_partial >= 10) {
+        g_ttt_partial = 0;
+        display.setFullWindow();
+    } else {
+        display.setPartialWindow(0, 0, display.width(), display.height());
+    }
+
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+
+        // Title
+        display.setFont(&FreeMonoBold9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+        display.setCursor(4, 18);
+        display.print("TIC TAC TOE");
+        display.drawFastHLine(0, 22, display.width(), GxEPD_BLACK);
+
+        // Grid lines
+        for (int c = 1; c < 3; c++)
+            display.drawFastVLine(OX + c * CELL_W, OY, GRID_H, GxEPD_BLACK);
+        for (int r = 1; r < 3; r++)
+            display.drawFastHLine(OX, OY + r * CELL_H, GRID_W, GxEPD_BLACK);
+
+        // Cells
+        for (int i = 0; i < 9; i++) {
+            int col = i % 3, row = i / 3;
+            int cx = OX + col * CELL_W;
+            int cy = OY + row * CELL_H;
+
+            // Highlight selected cell (only when game ongoing)
+            if (i == g_ttt_cursor && !g_ttt_winner)
+                display.fillRect(cx + 1, cy + 1, CELL_W - 2, CELL_H - 2, GxEPD_BLACK);
+
+            display.setFont(&FreeMonoBold9pt7b);
+            if (g_ttt_board[i] == 1 || g_ttt_board[i] == 2) {
+                const char* sym = (g_ttt_board[i] == 1) ? "X" : "O";
+                // Centre symbol in cell
+                int tx = cx + (CELL_W - 11) / 2;
+                int ty = cy + (CELL_H + 12) / 2;
+                if (i == g_ttt_cursor && !g_ttt_winner)
+                    display.setTextColor(GxEPD_WHITE); // invert on selected
+                else
+                    display.setTextColor(GxEPD_BLACK);
+                display.setCursor(tx, ty);
+                display.print(sym);
+            }
+            display.setTextColor(GxEPD_BLACK);
+        }
+
+        // Status line
+        display.setFont(&FreeMono9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+        display.drawFastHLine(0, OY + GRID_H + 4, display.width(), GxEPD_BLACK);
+        display.setCursor(4, OY + GRID_H + 18);
+        if (g_ttt_winner == 1)       display.print("X wins! SEL=new CXL=menu");
+        else if (g_ttt_winner == 2)  display.print("O wins! SEL=new CXL=menu");
+        else if (g_ttt_winner == 3)  display.print("Draw!   SEL=new CXL=menu");
+        else {
+            display.print(g_ttt_turn == 1 ? "X" : "O");
+            display.print(" turn  DIRS+SEL CXL=menu");
+        }
+    } while (display.nextPage());
+    display.hibernate();
+}
+
+// ── ID Card ───────────────────────────────────────────────────────────────────
+
+static void id_load_handle() {
+    Preferences prefs;
+    prefs.begin("badge", true);
+    String h = prefs.getString("handle", "");
+    prefs.end();
+    if (h.length() > 0) {
+        strncpy(g_handle, h.c_str(), sizeof(g_handle) - 1);
+        g_handle[sizeof(g_handle) - 1] = '\0';
+    } else {
+        strncpy(g_handle, g_callsign, sizeof(g_handle) - 1);
+        g_handle[sizeof(g_handle) - 1] = '\0';
+    }
+}
+
+static void id_save_handle() {
+    Preferences prefs;
+    prefs.begin("badge", false);
+    prefs.putString("handle", g_handle);
+    prefs.end();
+}
+
+static void draw_id_card() {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+
+        // ── Top bar: black banner with handle ──
+        display.fillRect(0, 0, display.width(), 36, GxEPD_BLACK);
+        display.setFont(&FreeMonoBold9pt7b);
+        display.setTextColor(GxEPD_WHITE);
+        display.setCursor(6, 14);
+        display.print("ONIONDAO BADGE");
+        display.setFont(&FreeMonoBold9pt7b);
+        // Handle centred on second line of banner
+        String handle = strlen(g_handle) > 0 ? g_handle : "(no handle)";
+        int hw = handle.length() * 11;
+        int hx = max(0, (264 - hw) / 2);
+        display.setCursor(hx, 30);
+        display.print(handle);
+
+        // ── MAC address ──
+        display.setTextColor(GxEPD_BLACK);
+        display.setFont(&FreeMono9pt7b);
+        display.setCursor(6, 52);
+        display.print("MAC:");
+        display.setCursor(6, 68);
+        display.print(WiFi.macAddress());
+
+        // ── Key fingerprint (first 16 bytes of pubkey as hex, 2 rows) ──
+        display.setCursor(6, 88);
+        display.print("KEY:");
+        if (g_atecc_ok) {
+            char hex[9];
+            // Row 1: bytes 0–7
+            display.setCursor(6, 104);
+            for (int i = 0; i < 8; i++) {
+                snprintf(hex, sizeof(hex), "%02X", g_atecc_pubkey[i]);
+                display.print(hex);
+                if (i == 3) display.print(" ");
+            }
+            // Row 2: bytes 8–15
+            display.setCursor(6, 120);
+            for (int i = 8; i < 16; i++) {
+                snprintf(hex, sizeof(hex), "%02X", g_atecc_pubkey[i]);
+                display.print(hex);
+                if (i == 11) display.print(" ");
+            }
+            display.setCursor(6, 136);
+            display.print("(+48 more bytes)");
+        } else {
+            display.setCursor(6, 104);
+            display.print("no crypto chip");
+        }
+
+        // ── Footer ──
+        display.drawFastHLine(0, 150, display.width(), GxEPD_BLACK);
+        display.setCursor(4, 165);
+        display.print("SEL:edit handle  CXL:back");
+    } while (display.nextPage());
+    display.hibernate();
+}
+
+static void draw_id_edit() {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        page_header("SET HANDLE");
+
+        display.setFont(&FreeMono9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+
+        // Show current handle with cursor position highlighted
+        display.setCursor(6, 52);
+        for (int i = 0; i < 15; i++) {
+            char c = (i < (int)strlen(g_handle)) ? g_handle[i] : '_';
+            if (i == g_id_edit_pos) {
+                display.fillRect(6 + i * 11, 37, 11, 18, GxEPD_BLACK);
+                display.setTextColor(GxEPD_WHITE);
+                display.setCursor(6 + i * 11, 52);
+                display.print(c);
+                display.setTextColor(GxEPD_BLACK);
+                display.setCursor(6 + (i + 1) * 11, 52);
+            } else {
+                display.setCursor(6 + i * 11, 52);
+                display.print(c);
+            }
+        }
+
+        // Character picker
+        display.drawFastHLine(0, 62, display.width(), GxEPD_BLACK);
+        int prev_idx = (g_id_edit_char_idx - 1 + EDIT_CHARSET_LEN) % EDIT_CHARSET_LEN;
+        int next_idx = (g_id_edit_char_idx + 1) % EDIT_CHARSET_LEN;
+        display.setCursor(6, 80);  display.print("UP  ["); display.print(EDIT_CHARSET[prev_idx]); display.print("]");
+        display.setCursor(6, 96);  display.print("    ["); display.print(EDIT_CHARSET[g_id_edit_char_idx]); display.print("] <- current");
+        display.setCursor(6, 112); display.print("DN  ["); display.print(EDIT_CHARSET[next_idx]); display.print("]");
+
+        page_footer("L/R:move SEL:save CXL:back");
+    } while (display.nextPage());
+    display.hibernate();
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 static void dispatch_render() {
@@ -1319,6 +1562,9 @@ static void dispatch_render() {
         case STATE_ESPNOW_TARGET: draw_espnow_target();       break;
         case STATE_ATECC_INTRO:   draw_atecc_intro();         break;
         case STATE_ATECC_DONE:    draw_atecc_done(g_atecc_ok); break;
+        case STATE_TTT:           draw_ttt();                 break;
+        case STATE_ID_CARD:       draw_id_card();             break;
+        case STATE_ID_EDIT:       draw_id_edit();             break;
     }
     g_needs_redraw = false;
 }
@@ -1359,6 +1605,17 @@ static void handle_buttons(uint8_t pressed) {
                             g_state = STATE_ESPNOW;
                         }
                         break;
+                    case 2:
+                        ttt_reset();
+                        g_state = STATE_TTT;
+                        break;
+                    case 3:
+                        id_load_handle();
+                        // Need WiFi up briefly just to read MAC
+                        if (WiFi.macAddress() == "00:00:00:00:00:00")
+                            WiFi.mode(WIFI_STA);
+                        g_state = STATE_ID_CARD;
+                        break;
                 }
                 g_needs_redraw = true;
             }
@@ -1372,6 +1629,98 @@ static void handle_buttons(uint8_t pressed) {
                 { g_sysinfo_page = (g_sysinfo_page + 1) % 2; g_needs_redraw = true; }
             if (pressed & BTN_CANCEL)
                 { g_state = STATE_MENU; g_needs_redraw = true; }
+            break;
+
+        case STATE_TTT:
+            if (g_ttt_winner) {
+                // Game over — SELECT starts new game, CANCEL back to menu
+                if (pressed & BTN_SELECT) { ttt_reset(); g_needs_redraw = true; }
+                if (pressed & BTN_CANCEL) { g_state = STATE_MENU; g_cursor = 2; g_needs_redraw = true; }
+            } else {
+                // Move cursor around the 3x3 grid
+                if (pressed & BTN_LEFT)  { if (g_ttt_cursor % 3 > 0) { g_ttt_cursor--; g_needs_redraw = true; } }
+                if (pressed & BTN_RIGHT) { if (g_ttt_cursor % 3 < 2) { g_ttt_cursor++; g_needs_redraw = true; } }
+                if (pressed & BTN_UP)    { if (g_ttt_cursor / 3 > 0) { g_ttt_cursor -= 3; g_needs_redraw = true; } }
+                if (pressed & BTN_DOWN)  { if (g_ttt_cursor / 3 < 2) { g_ttt_cursor += 3; g_needs_redraw = true; } }
+                if (pressed & BTN_SELECT) {
+                    if (!g_ttt_board[g_ttt_cursor]) {
+                        g_ttt_board[g_ttt_cursor] = g_ttt_turn;
+                        g_ttt_winner = ttt_check_winner();
+                        if (!g_ttt_winner) {
+                            g_ttt_turn = (g_ttt_turn == 1) ? 2 : 1;
+                            // Advance cursor to next empty cell for convenience
+                            for (int i = 1; i <= 9; i++) {
+                                int next = (g_ttt_cursor + i) % 9;
+                                if (!g_ttt_board[next]) { g_ttt_cursor = next; break; }
+                            }
+                        }
+                        g_needs_redraw = true;
+                    }
+                }
+                if (pressed & BTN_CANCEL) { g_state = STATE_MENU; g_cursor = 2; g_needs_redraw = true; }
+            }
+            break;
+
+        case STATE_ID_CARD:
+            if (pressed & BTN_SELECT) {
+                // Enter handle editor — seed char picker from first char
+                g_id_edit_pos = 0;
+                char c = (strlen(g_handle) > 0) ? g_handle[0] : 'A';
+                g_id_edit_char_idx = 0;
+                for (int i = 0; i < EDIT_CHARSET_LEN; i++) {
+                    if (EDIT_CHARSET[i] == c) { g_id_edit_char_idx = i; break; }
+                }
+                g_state = STATE_ID_EDIT;
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_CANCEL) { g_state = STATE_MENU; g_cursor = 3; g_needs_redraw = true; }
+            break;
+
+        case STATE_ID_EDIT:
+            if (pressed & BTN_UP) {
+                g_id_edit_char_idx = (g_id_edit_char_idx - 1 + EDIT_CHARSET_LEN) % EDIT_CHARSET_LEN;
+                g_handle[g_id_edit_pos] = EDIT_CHARSET[g_id_edit_char_idx];
+                g_handle[max(g_id_edit_pos + 1, (int)strlen(g_handle))] = '\0';
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_DOWN) {
+                g_id_edit_char_idx = (g_id_edit_char_idx + 1) % EDIT_CHARSET_LEN;
+                g_handle[g_id_edit_pos] = EDIT_CHARSET[g_id_edit_char_idx];
+                g_handle[max(g_id_edit_pos + 1, (int)strlen(g_handle))] = '\0';
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_RIGHT) {
+                if (g_id_edit_pos < 14) {
+                    g_id_edit_pos++;
+                    char c2 = (g_id_edit_pos < (int)strlen(g_handle)) ? g_handle[g_id_edit_pos] : 'A';
+                    g_id_edit_char_idx = 0;
+                    for (int i = 0; i < EDIT_CHARSET_LEN; i++) {
+                        if (EDIT_CHARSET[i] == c2) { g_id_edit_char_idx = i; break; }
+                    }
+                    g_needs_redraw = true;
+                }
+            }
+            if (pressed & BTN_LEFT) {
+                if (g_id_edit_pos > 0) {
+                    g_id_edit_pos--;
+                    char c2 = g_handle[g_id_edit_pos];
+                    g_id_edit_char_idx = 0;
+                    for (int i = 0; i < EDIT_CHARSET_LEN; i++) {
+                        if (EDIT_CHARSET[i] == c2) { g_id_edit_char_idx = i; break; }
+                    }
+                    g_needs_redraw = true;
+                }
+            }
+            if (pressed & BTN_SELECT) {
+                // Trim trailing spaces then save
+                int len = strlen(g_handle);
+                while (len > 0 && g_handle[len - 1] == ' ') len--;
+                g_handle[len] = '\0';
+                id_save_handle();
+                g_state = STATE_ID_CARD;
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_CANCEL) { g_state = STATE_ID_CARD; g_needs_redraw = true; }
             break;
 
         case STATE_ESPNOW:
