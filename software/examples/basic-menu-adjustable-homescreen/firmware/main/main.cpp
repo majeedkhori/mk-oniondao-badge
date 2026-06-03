@@ -17,7 +17,18 @@
 
 #include <SparkFun_ATECCX08a_Arduino_Library.h>
 
+#include <sodium.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+#include <qrcode.h>
+#include <mqtt_client.h>
 #include "badge_pins.h"
+#include "mqtt_config.h"
+
+// ── Serial chat protocol ──────────────────────────────────────────────────────
+// Laptop bridge sends:  MSG:<text>\n  → badge displays as incoming
+// Badge sends:          MSG:<text>\n  → bridge publishes to badge/tx MQTT topic
+#define SERIAL_MSG_PREFIX "MSG:"
 
 // ── TCA9534 (buttons) ─────────────────────────────────────────────────────────
 #define TCA9534_ADDR   0x20
@@ -130,6 +141,33 @@ static bool      g_atecc_available = false;  // chip found at 0x60
 static bool      g_atecc_ok        = false;  // provisioned + pubkey cached
 static uint8_t   g_atecc_pubkey[PUBLIC_KEY_SIZE] = {};
 
+// ── Solana wallet ─────────────────────────────────────────────────────────────
+static uint8_t g_wallet_pubkey[32]  = {};
+static char    g_wallet_address[48] = {};  // base58-encoded Ed25519 pubkey (~44 chars)
+static bool    g_wallet_ready       = false;
+
+// Pending sign request — populated by SGN: serial command
+static uint8_t g_sign_tx[1232] = {};
+static size_t  g_sign_tx_len   = 0;
+static bool    g_sign_pending  = false;
+
+// ── MQTT chat ─────────────────────────────────────────────────────────────────
+#define MQTT_MSG_MAX  5
+#define MQTT_MSG_LEN  32
+#define MQTT_COMPOSE_MAX 20  // max chars the on-badge editor can produce
+
+struct MqttMsg { char text[MQTT_MSG_LEN]; bool outgoing; };
+static MqttMsg                  g_mqtt_msgs[MQTT_MSG_MAX] = {};
+static int                      g_mqtt_msg_count  = 0;
+static bool                     g_mqtt_connected  = false;
+static volatile bool            g_mqtt_msg_flag   = false;
+static esp_mqtt_client_handle_t g_mqtt_client     = nullptr;
+static portMUX_TYPE             g_mqtt_mux        = portMUX_INITIALIZER_UNLOCKED;
+
+static char g_mqtt_compose[MQTT_COMPOSE_MAX + 1] = {};
+static int  g_mqtt_compose_pos  = 0;
+static int  g_mqtt_compose_char = 0;
+
 // Queued ECDSA verification (done in main loop, not in recv callback)
 static bool      g_needs_verify       = false;
 static BeaconMsg g_pending_verify     = {};
@@ -164,6 +202,10 @@ enum AppState {
     STATE_TTT,          // tic tac toe
     STATE_ID_CARD,      // badge ID card view
     STATE_ID_EDIT,      // handle editor
+    STATE_WALLET,       // Solana wallet QR code
+    STATE_WALLET_SIGN,  // Solana transaction signing approval
+    STATE_MQTT,         // MQTT chat view
+    STATE_MQTT_EDIT,    // MQTT message composer
 };
 
 static AppState g_state        = STATE_MENU;
@@ -173,12 +215,14 @@ static uint8_t  g_last_btns    = 0;
 static int      g_sysinfo_page = 0;   // 0=hardware 1=RNG
 static uint8_t  g_sysinfo_rng[16] = {};
 
-#define MENU_COUNT 4
+#define MENU_COUNT 6
 static const char* MENU_LABELS[MENU_COUNT] = {
     "1. System Info",
     "2. ESPNow Beacon",
     "3. Tic Tac Toe",
     "4. ID Card",
+    "5. Solana Wallet",
+    "6. MQTT Chat",
 };
 
 // ── ID Card state ─────────────────────────────────────────────────────────────
@@ -273,6 +317,41 @@ static void check_serial_image() {
                     (unsigned)g_peers[i].first_seen, (unsigned)g_peers[i].last_seen);
             }
             Serial.println("OK");
+            memset(hdr, 0, sizeof(hdr));
+            return;
+        }
+
+        // SGN:<hex>\n — sign transaction bytes with the wallet key
+        if (hdr[0]=='S' && hdr[1]=='G' && hdr[2]=='N' && hdr[3]==':') {
+            size_t   byte_len = 0;
+            int      nibble   = 0;
+            uint8_t  cur      = 0;
+            uint32_t deadline = millis() + 5000;
+            bool     bad      = false;
+            while (byte_len < sizeof(g_sign_tx)) {
+                if (millis() > deadline) { bad = true; break; }
+                int c = Serial.read();
+                if (c < 0) { yield(); continue; }
+                if (c == '\n' || c == '\r') break;
+                int n;
+                if      (c >= '0' && c <= '9') n = c - '0';
+                else if (c >= 'a' && c <= 'f') n = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') n = c - 'A' + 10;
+                else { bad = true; break; }
+                cur = (cur << 4) | (uint8_t)n;
+                if (++nibble == 2) { g_sign_tx[byte_len++] = cur; cur = 0; nibble = 0; }
+            }
+            if (bad || nibble != 0 || byte_len == 0) {
+                Serial.println("ERR:bad_sgn");
+            } else if (!g_wallet_ready) {
+                Serial.println("ERR:wallet_not_ready");
+            } else {
+                g_sign_tx_len   = byte_len;
+                g_sign_pending  = true;
+                g_state         = STATE_WALLET_SIGN;
+                g_needs_redraw  = true;
+                s_last_activity = millis();
+            }
             memset(hdr, 0, sizeof(hdr));
             return;
         }
@@ -570,6 +649,220 @@ static bool do_provision_atecc() {
     return true;
 }
 
+// ── Solana wallet ─────────────────────────────────────────────────────────────
+
+static void base58_encode(const uint8_t *data, size_t len, char *out) {
+    static const char ALPHA[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    uint8_t tmp[32];
+    memcpy(tmp, data, len);
+
+    int leading = 0;
+    for (size_t i = 0; i < len && tmp[i] == 0; i++) leading++;
+
+    char digits[48];
+    int  dlen = 0;
+    bool nonzero = true;
+    while (nonzero) {
+        int rem = 0;
+        nonzero = false;
+        for (size_t i = 0; i < len; i++) {
+            int val = rem * 256 + tmp[i];
+            tmp[i]  = (uint8_t)(val / 58);
+            rem     = val % 58;
+            if (tmp[i]) nonzero = true;
+        }
+        digits[dlen++] = ALPHA[rem];
+    }
+
+    int out_idx = 0;
+    for (int i = 0; i < leading; i++) out[out_idx++] = '1';
+    for (int i = dlen - 1; i >= 0; i--) out[out_idx++] = digits[i];
+    out[out_idx] = '\0';
+}
+
+static void init_wallet() {
+    nvs_handle_t nvs;
+    if (nvs_open("wallet", NVS_READWRITE, &nvs) != ESP_OK) {
+        Serial.println("[wallet] nvs_open failed");
+        return;
+    }
+
+    uint8_t   seed[32];
+    size_t    seed_len = sizeof(seed);
+    esp_err_t err = nvs_get_blob(nvs, "seed", seed, &seed_len);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        bool from_atecc = false;
+        if (g_atecc_available || g_atecc.begin(0x60, Wire, Serial)) {
+            g_atecc_available = true;
+            g_atecc.wakeUp();
+            g_atecc.updateRandom32Bytes();
+            memcpy(seed, g_atecc.random32Bytes, 32);
+            g_atecc.sleep();
+            from_atecc = true;
+        }
+        if (!from_atecc) {
+            for (int i = 0; i < 8; i++) {
+                uint32_t r = esp_random();
+                memcpy(seed + i * 4, &r, 4);
+            }
+        }
+        Serial.printf("[wallet] new seed from %s\n", from_atecc ? "ATECC TRNG" : "ESP32 RNG");
+        nvs_set_blob(nvs, "seed", seed, sizeof(seed));
+        nvs_commit(nvs);
+    } else if (err != ESP_OK) {
+        Serial.printf("[wallet] nvs_get_blob err %d\n", err);
+        nvs_close(nvs);
+        return;
+    }
+
+    nvs_close(nvs);
+
+    uint8_t sk[64];  // libsodium: sk = seed || pubkey (64 bytes)
+    crypto_sign_ed25519_seed_keypair(g_wallet_pubkey, sk, seed);
+    sodium_memzero(sk,   sizeof(sk));
+    sodium_memzero(seed, sizeof(seed));
+
+    base58_encode(g_wallet_pubkey, 32, g_wallet_address);
+    g_wallet_ready = true;
+    Serial.printf("[wallet] address: %s\n", g_wallet_address);
+}
+
+// Re-derive keypair from stored seed and produce a detached Ed25519 signature.
+// The private key is zeroed immediately after use.
+static bool wallet_sign(const uint8_t* msg, size_t msg_len, uint8_t sig_out[64]) {
+    nvs_handle_t nvs;
+    if (nvs_open("wallet", NVS_READONLY, &nvs) != ESP_OK) return false;
+    uint8_t seed[32];
+    size_t  seed_len = sizeof(seed);
+    esp_err_t err = nvs_get_blob(nvs, "seed", seed, &seed_len);
+    nvs_close(nvs);
+    if (err != ESP_OK) return false;
+
+    uint8_t pk[32], sk[64];
+    crypto_sign_ed25519_seed_keypair(pk, sk, seed);
+    sodium_memzero(seed, sizeof(seed));
+
+    int ret = crypto_sign_ed25519_detached(sig_out, nullptr, msg, (unsigned long long)msg_len, sk);
+    sodium_memzero(sk, sizeof(sk));
+    return ret == 0;
+}
+
+// ── MQTT chat ─────────────────────────────────────────────────────────────────
+
+static void mqtt_push_msg(const char* text, bool outgoing) {
+    portENTER_CRITICAL(&g_mqtt_mux);
+    if (g_mqtt_msg_count < MQTT_MSG_MAX) {
+        strncpy(g_mqtt_msgs[g_mqtt_msg_count].text, text, MQTT_MSG_LEN - 1);
+        g_mqtt_msgs[g_mqtt_msg_count].text[MQTT_MSG_LEN - 1] = '\0';
+        g_mqtt_msgs[g_mqtt_msg_count].outgoing = outgoing;
+        g_mqtt_msg_count++;
+    } else {
+        // Ring: shift out oldest
+        memmove(&g_mqtt_msgs[0], &g_mqtt_msgs[1], (MQTT_MSG_MAX - 1) * sizeof(MqttMsg));
+        strncpy(g_mqtt_msgs[MQTT_MSG_MAX - 1].text, text, MQTT_MSG_LEN - 1);
+        g_mqtt_msgs[MQTT_MSG_MAX - 1].text[MQTT_MSG_LEN - 1] = '\0';
+        g_mqtt_msgs[MQTT_MSG_MAX - 1].outgoing = outgoing;
+    }
+    portEXIT_CRITICAL(&g_mqtt_mux);
+}
+
+static void mqtt_event_handler(void* /*args*/, esp_event_base_t /*base*/,
+                                int32_t event_id, void* event_data) {
+    auto* event = (esp_mqtt_event_handle_t)event_data;
+    switch (event_id) {
+        case MQTT_EVENT_CONNECTED:
+            g_mqtt_connected = true;
+            esp_mqtt_client_subscribe(g_mqtt_client, MQTT_TOPIC_RX, 0);
+            Serial.println("[mqtt] connected, subscribed to " MQTT_TOPIC_RX);
+            g_mqtt_msg_flag = true;
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            g_mqtt_connected = false;
+            Serial.println("[mqtt] disconnected");
+            g_mqtt_msg_flag = true;
+            break;
+        case MQTT_EVENT_DATA: {
+            // event->data is NOT null-terminated — copy with length guard
+            int len = (event->data_len < MQTT_MSG_LEN - 1) ? event->data_len : MQTT_MSG_LEN - 1;
+            char buf[MQTT_MSG_LEN];
+            memcpy(buf, event->data, len);
+            buf[len] = '\0';
+            Serial.printf("[mqtt] rx: %s\n", buf);
+            mqtt_push_msg(buf, false);
+            g_mqtt_msg_flag = true;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static void mqtt_publish(const char* text) {
+    if (!g_mqtt_connected || !g_mqtt_client) return;
+    esp_mqtt_client_publish(g_mqtt_client, MQTT_TOPIC_TX, text, 0, 0, 0);
+    Serial.printf("[mqtt] tx: %s\n", text);
+    mqtt_push_msg(text, true);
+    g_mqtt_msg_flag = true;
+}
+
+static void init_mqtt() {
+    // Show connecting screen immediately (blocks until WiFi up or timeout)
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        page_header("MQTT CHAT");
+        display.setFont(&FreeMono9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+        display.setCursor(8, 70);
+        display.print("Connecting to WiFi...");
+        page_footer("CXL:cancel");
+    } while (display.nextPage());
+    display.hibernate();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(MQTT_WIFI_SSID, MQTT_WIFI_PASS);
+
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+        delay(200);
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[mqtt] WiFi connect failed");
+        display.setFullWindow();
+        display.firstPage();
+        do {
+            page_header("MQTT CHAT");
+            display.setFont(&FreeMono9pt7b);
+            display.setTextColor(GxEPD_BLACK);
+            display.setCursor(8, 70);
+            display.print("WiFi failed.");
+            display.setCursor(8, 88);
+            display.print("Check credentials.");
+            page_footer("any button: back");
+        } while (display.nextPage());
+        display.hibernate();
+        g_state = STATE_MENU;
+        g_needs_redraw = false;
+        return;
+    }
+
+    Serial.printf("[mqtt] WiFi connected, IP %s\n", WiFi.localIP().toString().c_str());
+
+    if (!g_mqtt_client) {
+        esp_mqtt_client_config_t cfg = {};
+        cfg.broker.address.uri = MQTT_BROKER_URI;
+        g_mqtt_client = esp_mqtt_client_init(&cfg);
+        esp_mqtt_client_register_event(g_mqtt_client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID,
+                                       mqtt_event_handler, nullptr);
+        esp_mqtt_client_start(g_mqtt_client);
+    }
+
+    g_state = STATE_MQTT;
+    g_needs_redraw = true;
+}
+
 static void draw_atecc_intro() {
     display.setFullWindow();
     display.firstPage();
@@ -622,6 +915,199 @@ static void draw_atecc_done(bool success) {
             display.print("without signatures.");
         }
         page_footer("any button to continue");
+    } while (display.nextPage());
+    display.hibernate();
+}
+
+// QR render context — set before calling esp_qrcode_generate inside page loop
+static struct { int x0, y0, scale; } s_qr_ctx;
+
+static void qr_render_cb(esp_qrcode_handle_t qrcode) {
+    int sz = esp_qrcode_get_size(qrcode);
+    for (int r = 0; r < sz; r++)
+        for (int c = 0; c < sz; c++)
+            if (esp_qrcode_get_module(qrcode, c, r))
+                display.fillRect(s_qr_ctx.x0 + c * s_qr_ctx.scale,
+                                 s_qr_ctx.y0 + r * s_qr_ctx.scale,
+                                 s_qr_ctx.scale, s_qr_ctx.scale, GxEPD_BLACK);
+}
+
+static void draw_wallet_screen() {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        page_header("SOL WALLET");
+        display.setFont(&FreeMono9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+
+        if (!g_wallet_ready) {
+            display.setCursor(8, 70);
+            display.print("Wallet not ready.");
+        } else {
+            // Version 4 QR in byte mode with ECC_MED fits 44-char Solana address → 33×33 modules
+            int scale = 2;
+            int sz    = 33;
+            s_qr_ctx.scale = scale;
+            s_qr_ctx.x0    = (display.width()  - sz * scale) / 2;
+            s_qr_ctx.y0    = 34 + (111 - sz * scale) / 2;  // centered in y=34..145 content area
+
+            esp_qrcode_config_t cfg;
+            cfg.display_func       = qr_render_cb;
+            cfg.max_qrcode_version = 4;
+            cfg.qrcode_ecc_level   = ESP_QRCODE_ECC_MED;
+            esp_qrcode_generate(&cfg, g_wallet_address);
+
+            // Abbreviated address: first 6 ... last 6
+            char short_addr[20];
+            size_t alen = strlen(g_wallet_address);
+            snprintf(short_addr, sizeof(short_addr), "%.6s...%.6s",
+                     g_wallet_address,
+                     alen >= 6 ? g_wallet_address + alen - 6 : g_wallet_address);
+
+            int16_t tx, ty; uint16_t tw, th;
+            display.getTextBounds(short_addr, 0, 0, &tx, &ty, &tw, &th);
+            display.setCursor((display.width() - (int16_t)tw) / 2, 138);
+            display.print(short_addr);
+        }
+        page_footer("CXL:back");
+    } while (display.nextPage());
+    display.hibernate();
+}
+
+static void draw_wallet_sign_screen() {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        page_header("SIGN TRANSACTION");
+        display.setFont(&FreeMono9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+
+        char buf[36];
+        snprintf(buf, sizeof(buf), "Size: %u bytes", (unsigned)g_sign_tx_len);
+        display.setCursor(8, 50);
+        display.print(buf);
+
+        // First 8 bytes as a quick visual prefix
+        size_t preview = g_sign_tx_len < 8 ? g_sign_tx_len : 8;
+        char pfx[20] = {};
+        for (size_t i = 0; i < preview; i++)
+            snprintf(pfx + i * 2, 3, "%02x", g_sign_tx[i]);
+        snprintf(buf, sizeof(buf), "%.16s...", pfx);
+        display.setCursor(8, 68);
+        display.print(buf);
+
+        // SHA256 fingerprint (first 4 + last 4 bytes)
+        uint8_t hash[32];
+        mbedtls_sha256(g_sign_tx, g_sign_tx_len, hash, 0);
+        char fp[24];
+        snprintf(fp, sizeof(fp), "%02x%02x%02x%02x..%02x%02x%02x%02x",
+            hash[0], hash[1], hash[2], hash[3],
+            hash[28], hash[29], hash[30], hash[31]);
+        display.setCursor(8, 86);
+        display.print("Hash:");
+        display.setCursor(8, 104);
+        display.print(fp);
+
+        display.setCursor(8, 128);
+        display.print("Sign with your key?");
+
+        page_footer("SEL:sign  CXL:reject");
+    } while (display.nextPage());
+    display.hibernate();
+}
+
+static void draw_mqtt_screen() {
+    if (++g_partial_count >= 10) {
+        g_partial_count = 0;
+        display.setFullWindow();
+    } else {
+        display.setPartialWindow(0, 0, display.width(), display.height());
+    }
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setFont(&FreeMonoBold9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+        display.setCursor(8, 22);
+        display.print("MQTT CHAT");
+        // Connection status right-aligned
+        const char* status = g_mqtt_connected ? "[OK]" : "[--]";
+        int16_t sx, sy; uint16_t sw, sh;
+        display.getTextBounds(status, 0, 0, &sx, &sy, &sw, &sh);
+        display.setCursor(display.width() - sw - 8, 22);
+        display.print(status);
+        display.drawFastHLine(0, 30, display.width(), GxEPD_BLACK);
+
+        display.setFont(&FreeMono9pt7b);
+        // Show messages oldest→newest, up to MQTT_MSG_MAX lines
+        portENTER_CRITICAL(&g_mqtt_mux);
+        int count = g_mqtt_msg_count;
+        MqttMsg snap[MQTT_MSG_MAX];
+        memcpy(snap, g_mqtt_msgs, count * sizeof(MqttMsg));
+        portEXIT_CRITICAL(&g_mqtt_mux);
+
+        for (int i = 0; i < count; i++) {
+            int y = 48 + i * 19;
+            if (y > 140) break;
+            char line[26];
+            snprintf(line, sizeof(line), "%s %.20s",
+                     snap[i].outgoing ? "<" : ">", snap[i].text);
+            display.setCursor(8, y);
+            display.print(line);
+        }
+        page_footer("SEL:compose  CXL:back");
+    } while (display.nextPage());
+    display.hibernate();
+}
+
+static void draw_mqtt_edit_screen() {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        page_header("COMPOSE");
+        display.setFont(&FreeMonoBold9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+
+        // Show up to 12 characters of compose buffer with cursor highlight
+        int visible = min(MQTT_COMPOSE_MAX, 12);
+        for (int i = 0; i < visible; i++) {
+            int cx = 8 + i * 20;
+            char ch = (g_mqtt_compose[i] != '\0') ? g_mqtt_compose[i] : ' ';
+            if (i == g_mqtt_compose_pos) {
+                display.fillRect(cx - 1, 36, 18, 20, GxEPD_BLACK);
+                display.setTextColor(GxEPD_WHITE);
+                display.setCursor(cx, 52);
+                display.print(ch);
+                display.setTextColor(GxEPD_BLACK);
+            } else {
+                display.setCursor(cx, 52);
+                display.print(ch);
+            }
+        }
+        // Scroll indicator if cursor is beyond visible range
+        if (g_mqtt_compose_pos >= 12) {
+            display.setCursor(8, 68);
+            display.setFont(&FreeMono9pt7b);
+            display.printf("pos:%d  %.12s", g_mqtt_compose_pos,
+                           g_mqtt_compose + g_mqtt_compose_pos - 6);
+            display.setFont(&FreeMonoBold9pt7b);
+        }
+
+        // UP/current/DOWN charset hints
+        display.setFont(&FreeMono9pt7b);
+        int cur = g_mqtt_compose_char;
+        char up_c  = EDIT_CHARSET[(cur - 1 + EDIT_CHARSET_LEN) % EDIT_CHARSET_LEN];
+        char dn_c  = EDIT_CHARSET[(cur + 1) % EDIT_CHARSET_LEN];
+        char cx_ch[4] = { up_c, ' ', dn_c, '\0' };
+        int px = 8 + g_mqtt_compose_pos * 20;
+        if (px > 200) px = 200;
+        display.setCursor(px, 80);  display.printf("%c", up_c);
+        display.setCursor(px, 96);  display.printf("%c", EDIT_CHARSET[cur]);
+        display.setCursor(px, 112); display.printf("%c", dn_c);
+        (void)cx_ch;  // suppress unused warning
+
+        page_footer("RGT:nxt SEL:send CXL");
     } while (display.nextPage());
     display.hibernate();
 }
@@ -709,7 +1195,7 @@ static void add_ping_peer(const uint8_t* mac) {
 }
 
 static void on_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-    const uint8_t* mac = info->src_addr;
+    const uint8_t* mac = info->src_addr;  // arduino-esp32 3.x: sender MAC moved into recv_info
     if ((size_t)len == sizeof(BeaconMsg)) {
         BeaconMsg msg;
         memcpy(&msg, data, sizeof(BeaconMsg));
@@ -1565,6 +2051,10 @@ static void dispatch_render() {
         case STATE_TTT:           draw_ttt();                 break;
         case STATE_ID_CARD:       draw_id_card();             break;
         case STATE_ID_EDIT:       draw_id_edit();             break;
+        case STATE_WALLET:        draw_wallet_screen();        break;
+        case STATE_WALLET_SIGN:   draw_wallet_sign_screen();   break;
+        case STATE_MQTT:          draw_mqtt_screen();          break;
+        case STATE_MQTT_EDIT:     draw_mqtt_edit_screen();     break;
     }
     g_needs_redraw = false;
 }
@@ -1615,6 +2105,12 @@ static void handle_buttons(uint8_t pressed) {
                         if (WiFi.macAddress() == "00:00:00:00:00:00")
                             WiFi.mode(WIFI_STA);
                         g_state = STATE_ID_CARD;
+                        break;
+                    case 4:
+                        g_state = STATE_WALLET;
+                        break;
+                    case 5:
+                        init_mqtt();  // sets g_state = STATE_MQTT on success
                         break;
                 }
                 g_needs_redraw = true;
@@ -1880,6 +2376,92 @@ static void handle_buttons(uint8_t pressed) {
                 { g_state = STATE_ESPNOW; g_needs_redraw = true; }
             break;
 
+        case STATE_WALLET:
+            if (pressed & BTN_CANCEL) { g_state = STATE_MENU; g_needs_redraw = true; }
+            break;
+
+        case STATE_WALLET_SIGN:
+            if (pressed & BTN_SELECT) {
+                if (g_sign_pending && g_wallet_ready) {
+                    uint8_t sig[64];
+                    if (wallet_sign(g_sign_tx, g_sign_tx_len, sig)) {
+                        Serial.print("SIG:");
+                        for (int i = 0; i < 64; i++) Serial.printf("%02x", sig[i]);
+                        Serial.println();
+                    } else {
+                        Serial.println("ERR:sign_failed");
+                    }
+                } else {
+                    Serial.println("ERR:not_ready");
+                }
+                g_sign_pending = false;
+                g_sign_tx_len  = 0;
+                g_state        = STATE_WALLET;
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_CANCEL) {
+                Serial.println("ERR:rejected");
+                g_sign_pending = false;
+                g_sign_tx_len  = 0;
+                g_state        = STATE_WALLET;
+                g_needs_redraw = true;
+            }
+            break;
+
+        case STATE_MQTT:
+            if (pressed & BTN_CANCEL) { g_state = STATE_MENU; g_needs_redraw = true; }
+            if (pressed & BTN_SELECT) {
+                memset(g_mqtt_compose, 0, sizeof(g_mqtt_compose));
+                g_mqtt_compose_pos  = 0;
+                g_mqtt_compose_char = 0;
+                g_state = STATE_MQTT_EDIT;
+                g_needs_redraw = true;
+            }
+            break;
+
+        case STATE_MQTT_EDIT:
+            if (pressed & BTN_UP) {
+                g_mqtt_compose_char = (g_mqtt_compose_char - 1 + EDIT_CHARSET_LEN) % EDIT_CHARSET_LEN;
+                g_mqtt_compose[g_mqtt_compose_pos] = EDIT_CHARSET[g_mqtt_compose_char];
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_DOWN) {
+                g_mqtt_compose_char = (g_mqtt_compose_char + 1) % EDIT_CHARSET_LEN;
+                g_mqtt_compose[g_mqtt_compose_pos] = EDIT_CHARSET[g_mqtt_compose_char];
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_RIGHT) {
+                if (g_mqtt_compose_pos < MQTT_COMPOSE_MAX - 1) {
+                    g_mqtt_compose_pos++;
+                    char c = g_mqtt_compose[g_mqtt_compose_pos];
+                    if (!c) { g_mqtt_compose[g_mqtt_compose_pos] = 'A'; c = 'A'; }
+                    g_mqtt_compose_char = 0;
+                    for (int i = 0; i < EDIT_CHARSET_LEN; i++)
+                        if (EDIT_CHARSET[i] == c) { g_mqtt_compose_char = i; break; }
+                }
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_LEFT) {
+                if (g_mqtt_compose_pos > 0) {
+                    g_mqtt_compose_pos--;
+                    char c = g_mqtt_compose[g_mqtt_compose_pos];
+                    g_mqtt_compose_char = 0;
+                    for (int i = 0; i < EDIT_CHARSET_LEN; i++)
+                        if (EDIT_CHARSET[i] == c) { g_mqtt_compose_char = i; break; }
+                }
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_SELECT) {
+                // Trim trailing spaces
+                int len = strlen(g_mqtt_compose);
+                while (len > 0 && g_mqtt_compose[len - 1] == ' ') g_mqtt_compose[--len] = '\0';
+                if (len > 0) mqtt_publish(g_mqtt_compose);
+                g_state = STATE_MQTT;
+                g_needs_redraw = true;
+            }
+            if (pressed & BTN_CANCEL) { g_state = STATE_MQTT; g_needs_redraw = true; }
+            break;
+
         default:
             if (pressed & BTN_CANCEL)
                 { g_state = STATE_MENU; g_needs_redraw = true; }
@@ -1906,6 +2488,15 @@ void setup() {
     memset(g_captures, 0, MAX_CAPTURES * sizeof(CaptureRecord));
 
     init_peripherals();
+
+    // Initialize NVS partition (required before nvs_open; idempotent if already up)
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    init_wallet();
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
@@ -1954,6 +2545,11 @@ void loop() {
     if (g_recv_flag && g_state == STATE_ESPNOW) {
         g_recv_flag    = false;
         g_needs_redraw = true;
+    }
+
+    if (g_mqtt_msg_flag) {
+        g_mqtt_msg_flag = false;
+        if (g_state == STATE_MQTT) g_needs_redraw = true;
     }
 
     // Send pong reply from main loop (safe context)

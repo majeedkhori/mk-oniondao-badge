@@ -1,0 +1,9 @@
+dependencies:
+  espressif/arduino-esp32:
+    version: "3.3.8"
+  espressif/lua:
+    version: "^5.5.0"
+  espressif/libsodium:
+    version: "^1.0.22"
+  espressif/esp-cryptoauthlib:
+    version: "^3.7.7~5"
