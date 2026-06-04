@@ -72,37 +72,40 @@ local function energy_pips(top, energy)
     if energy >= 3 then onion.gfx_text(px + 6, top + 9, "SPECIAL!", 1) end
 end
 
--- move icons, centered at (cx,cy), ~ +/-15px
-local function icon_slash(cx, cy)
-    onion.gfx_line(cx-12, cy+14, cx+12, cy-14)
-    onion.gfx_line(cx-10, cy+14, cx+14, cy-12)
-    onion.gfx_line(cx-15, cy+8, cx-5, cy+16)   -- hilt
+-- move icons, centered at (cx,cy), scaled to radius r (all integer math)
+local function icon_slash(cx, cy, r)
+    onion.gfx_line(cx-r, cy+r, cx+r, cy-r)
+    onion.gfx_line(cx-r+2, cy+r, cx+r+2, cy-r+2)
+    onion.gfx_line(cx-r-1, cy+r-3, cx-r+5, cy+r+3)   -- hilt
 end
-local function icon_shield(cx, cy)
-    onion.gfx_line(cx-13, cy-13, cx+13, cy-13)
-    onion.gfx_line(cx-13, cy-13, cx-13, cy+3)
-    onion.gfx_line(cx+13, cy-13, cx+13, cy+3)
-    onion.gfx_line(cx-13, cy+3, cx, cy+16)
-    onion.gfx_line(cx+13, cy+3, cx, cy+16)
-    onion.gfx_line(cx, cy-8, cx, cy+8)         -- cross
-    onion.gfx_line(cx-7, cy-2, cx+7, cy-2)
+local function icon_shield(cx, cy, r)
+    local pb = cy + r + 2
+    onion.gfx_line(cx-r, cy-r, cx+r, cy-r)           -- top edge
+    onion.gfx_line(cx-r, cy-r, cx-r, cy)             -- left side
+    onion.gfx_line(cx+r, cy-r, cx+r, cy)             -- right side
+    onion.gfx_line(cx-r, cy, cx, pb)                 -- to bottom point
+    onion.gfx_line(cx+r, cy, cx, pb)
+    onion.gfx_line(cx, cy-r+3, cx, cy+r-2)           -- cross
+    onion.gfx_line(cx-r+4, cy-2, cx+r-4, cy-2)
 end
-local function icon_blast(cx, cy)
-    onion.gfx_line(cx, cy-15, cx, cy+15)
-    onion.gfx_line(cx-15, cy, cx+15, cy)
-    onion.gfx_line(cx-11, cy-11, cx+11, cy+11)
-    onion.gfx_line(cx-11, cy+11, cx+11, cy-11)
-    onion.gfx_circle(cx, cy, 4, true)
+local function icon_blast(cx, cy, r)
+    local d = math.floor(r * 3 / 4)
+    onion.gfx_line(cx, cy-r, cx, cy+r)
+    onion.gfx_line(cx-r, cy, cx+r, cy)
+    onion.gfx_line(cx-d, cy-d, cx+d, cy+d)
+    onion.gfx_line(cx-d, cy+d, cx+d, cy-d)
+    onion.gfx_circle(cx, cy, math.max(2, math.floor(r/3)), true)
 end
-local function icon_special(cx, cy)
-    onion.gfx_triangle(cx, cy-15, cx-13, cy+4, cx+13, cy+4, true)
-    onion.gfx_triangle(cx, cy+15, cx-13, cy-4, cx+13, cy-4, true)
+local function icon_special(cx, cy, r)
+    local h = math.floor(r/3)
+    onion.gfx_triangle(cx, cy-r, cx-r, cy+h, cx+r, cy+h, true)
+    onion.gfx_triangle(cx, cy+r, cx-r, cy-h, cx+r, cy-h, true)
 end
-local function draw_icon(move, cx, cy)
-    if move == "SLASH"   then icon_slash(cx, cy)
-    elseif move == "SHIELD" then icon_shield(cx, cy)
-    elseif move == "BLAST"  then icon_blast(cx, cy)
-    elseif move == "SPECIAL" then icon_special(cx, cy) end
+local function draw_icon(move, cx, cy, r)
+    if move == "SLASH"   then icon_slash(cx, cy, r)
+    elseif move == "SHIELD" then icon_shield(cx, cy, r)
+    elseif move == "BLAST"  then icon_blast(cx, cy, r)
+    elseif move == "SPECIAL" then icon_special(cx, cy, r) end
 end
 
 local function centered(name, boxx, boxw)
@@ -119,9 +122,9 @@ local function draw_pick(round, you, opp, en_you, sy, sc)
     for _, b in ipairs(boxes) do
         local x = b[1]
         onion.gfx_rect(x, 86, 80, 60, false)
-        onion.gfx_text(x + 35, 100, b[2], 1)
-        draw_icon(b[3], x + 40, 120)
-        onion.gfx_text(centered(b[3], x, 80), 142, b[3], 1)
+        onion.gfx_text(x + 35, 99, b[2], 1)             -- key letter (top)
+        draw_icon(b[3], x + 40, 116, 11)                -- icon (box center, smaller)
+        onion.gfx_text(centered(b[3], x, 80), 143, b[3], 1)  -- name (bottom)
     end
     if en_you >= 3 then
         onion.gfx_text(4, 162, "SELECT=SPECIAL  CXL=quit", 1)
@@ -134,11 +137,11 @@ end
 local function draw_clash(round, mine, theirs, you_take, cpu_take, you, opp)
     onion.gfx_clear()
     titlebar("ROUND " .. round .. "  -  CLASH!")
-    draw_icon(mine, 40, 54)
+    draw_icon(mine, 40, 54, 15)
     onion.gfx_text(centered(mine, 4, 72), 84, mine, 1)
     onion.gfx_text(centered("-" .. you_take, 4, 72), 102, "-" .. you_take, 1)
     onion.gfx_text(116, 64, "VS", 2)
-    draw_icon(theirs, 224, 54)
+    draw_icon(theirs, 224, 54, 15)
     onion.gfx_text(centered(theirs, 188, 72), 84, theirs, 1)
     onion.gfx_text(centered("-" .. cpu_take, 188, 72), 102, "-" .. cpu_take, 1)
     hpbar("YOU", 112, you)
