@@ -11,6 +11,9 @@
 #include <cJSON.h>
 #include <mbedtls/base64.h>
 #include <sodium.h>
+#include <math.h>
+#include "driver/i2s_std.h"
+#include "driver/i2s_pdm.h"
 
 extern "C" {
 #include "cryptoauthlib.h"
@@ -608,8 +611,11 @@ static void refreshScriptList() {
     File file = root.openNextFile();
     while (file) {
         String name = file.name();
-        if (!file.isDirectory() && name.startsWith("/scripts_") && name.endsWith(".lua")) {
-            g_scripts.push_back(name);
+        // arduino-esp32 3.x File::name() returns the basename (no leading '/');
+        // 2.x returned the full path. Normalize so listing works on both.
+        if (name.startsWith("/")) name.remove(0, 1);
+        if (!file.isDirectory() && name.startsWith("scripts_") && name.endsWith(".lua")) {
+            g_scripts.push_back("/" + name);
         }
         file = root.openNextFile();
     }
@@ -1677,6 +1683,159 @@ static int luaOnionClearDisplay(lua_State*) {
     return 0;
 }
 
+// onion.show(text) — clear screen and draw text immediately (renders during a
+// script, unlike onion.log). '\n' starts a new line. Leaves the image up;
+// any button press dismisses it back to the status screen (handled by the
+// firmware because g_luaDisplayActive is set).
+static int luaOnionShow(lua_State* L) {
+    const char* text = luaL_checkstring(L, 1);
+    String s(text);
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setTextColor(GxEPD_BLACK);
+        display.setFont(&FreeMono9pt7b);
+        int y = 20;
+        int start = 0;
+        while (start <= (int)s.length()) {
+            int nl = s.indexOf('\n', start);
+            String line = (nl < 0) ? s.substring(start) : s.substring(start, nl);
+            display.setCursor(6, y);
+            display.print(line);
+            y += 18;
+            if (nl < 0) break;
+            start = nl + 1;
+        }
+    } while (display.nextPage());
+    g_luaDisplayActive = true;
+    g_needsRedraw = false;
+    return 0;
+}
+
+// ── Lua 2D graphics ─────────────────────────────────────────────────────────
+// The e-paper uses paged rendering, so every draw op must be re-issued on each
+// page. We record ops from Lua into g_gfx, then replay them inside one paged
+// refresh on gfx_show(). Screen is 264x176 (rotation 1). Text y = baseline.
+struct GfxCmd { uint8_t type; int a, b, c, d, e, f; String text; };
+static std::vector<GfxCmd> g_gfx;
+// type: 0=text(a=x,b=baselineY,c=size 1|2,d=white?) 1=rect 2=fillrect
+//       3=line 4=circle 5=fillcircle (a,b=cx,cy c=r) 6=triangle 7=filltriangle
+//       (a..f = x0,y0,x1,y1,x2,y2)
+
+static int luaOnionGfxClear(lua_State*) {
+    g_gfx.clear();
+    return 0;
+}
+
+static int luaOnionGfxText(lua_State* L) {
+    GfxCmd cmd;
+    cmd.type = 0;
+    cmd.a = (int)luaL_checkinteger(L, 1);
+    cmd.b = (int)luaL_checkinteger(L, 2);
+    cmd.text = luaL_checkstring(L, 3);
+    cmd.c = (int)luaL_optinteger(L, 4, 1);      // 1 = normal, 2 = big bold
+    cmd.d = lua_toboolean(L, 5) ? 1 : 0;        // white text (for on-black)
+    g_gfx.push_back(cmd);
+    return 0;
+}
+
+static int luaOnionGfxRect(lua_State* L) {
+    GfxCmd cmd;
+    cmd.a = (int)luaL_checkinteger(L, 1);
+    cmd.b = (int)luaL_checkinteger(L, 2);
+    cmd.c = (int)luaL_checkinteger(L, 3);
+    cmd.d = (int)luaL_checkinteger(L, 4);
+    cmd.type = lua_toboolean(L, 5) ? 2 : 1;     // filled?
+    g_gfx.push_back(cmd);
+    return 0;
+}
+
+static int luaOnionGfxLine(lua_State* L) {
+    GfxCmd cmd;
+    cmd.type = 3;
+    cmd.a = (int)luaL_checkinteger(L, 1);
+    cmd.b = (int)luaL_checkinteger(L, 2);
+    cmd.c = (int)luaL_checkinteger(L, 3);
+    cmd.d = (int)luaL_checkinteger(L, 4);
+    g_gfx.push_back(cmd);
+    return 0;
+}
+
+static int luaOnionGfxCircle(lua_State* L) {
+    GfxCmd cmd{};
+    cmd.a = (int)luaL_checkinteger(L, 1);   // cx
+    cmd.b = (int)luaL_checkinteger(L, 2);   // cy
+    cmd.c = (int)luaL_checkinteger(L, 3);   // r
+    cmd.type = lua_toboolean(L, 4) ? 5 : 4; // filled?
+    g_gfx.push_back(cmd);
+    return 0;
+}
+
+static int luaOnionGfxTriangle(lua_State* L) {
+    GfxCmd cmd{};
+    cmd.a = (int)luaL_checkinteger(L, 1);
+    cmd.b = (int)luaL_checkinteger(L, 2);
+    cmd.c = (int)luaL_checkinteger(L, 3);
+    cmd.d = (int)luaL_checkinteger(L, 4);
+    cmd.e = (int)luaL_checkinteger(L, 5);
+    cmd.f = (int)luaL_checkinteger(L, 6);
+    cmd.type = lua_toboolean(L, 7) ? 7 : 6; // filled?
+    g_gfx.push_back(cmd);
+    return 0;
+}
+
+// onion.kv_set(key, value) / onion.kv_get(key [, default]) — persist short
+// strings in NVS (namespace "luakv"). Survives power cycles. Keys <= 15 chars.
+static int luaOnionKvGet(lua_State* L) {
+    const char* key = luaL_checkstring(L, 1);
+    const char* def = luaL_optstring(L, 2, "");
+    Preferences p;
+    p.begin("luakv", true);
+    String v = p.getString(key, def);
+    p.end();
+    lua_pushstring(L, v.c_str());
+    return 1;
+}
+
+static int luaOnionKvSet(lua_State* L) {
+    const char* key = luaL_checkstring(L, 1);
+    const char* val = luaL_checkstring(L, 2);
+    Preferences p;
+    p.begin("luakv", false);
+    p.putString(key, val);
+    p.end();
+    return 0;
+}
+
+static int luaOnionGfxShow(lua_State*) {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        for (const GfxCmd& c : g_gfx) {
+            switch (c.type) {
+                case 0:
+                    display.setFont(c.c >= 2 ? &FreeMonoBold18pt7b : &FreeMono9pt7b);
+                    display.setTextColor(c.d ? GxEPD_WHITE : GxEPD_BLACK);
+                    display.setCursor(c.a, c.b);
+                    display.print(c.text);
+                    break;
+                case 1: display.drawRect(c.a, c.b, c.c, c.d, GxEPD_BLACK); break;
+                case 2: display.fillRect(c.a, c.b, c.c, c.d, GxEPD_BLACK); break;
+                case 3: display.drawLine(c.a, c.b, c.c, c.d, GxEPD_BLACK); break;
+                case 4: display.drawCircle(c.a, c.b, c.c, GxEPD_BLACK); break;
+                case 5: display.fillCircle(c.a, c.b, c.c, GxEPD_BLACK); break;
+                case 6: display.drawTriangle(c.a, c.b, c.c, c.d, c.e, c.f, GxEPD_BLACK); break;
+                case 7: display.fillTriangle(c.a, c.b, c.c, c.d, c.e, c.f, GxEPD_BLACK); break;
+            }
+        }
+    } while (display.nextPage());
+    g_luaDisplayActive = true;
+    g_needsRedraw = false;
+    return 0;
+}
+
 static int luaOnionReleaseDisplay(lua_State*) {
     g_luaDisplayActive = false;
     g_needsRedraw = true;
@@ -1715,8 +1874,10 @@ static int luaOnionImages(lua_State* L) {
     File file = root.openNextFile();
     while (file) {
         String name = file.name();
-        if (!file.isDirectory() && name.startsWith("/images_")) {
-            name.remove(0, 8);
+        // Normalize basename vs full-path between arduino-esp32 2.x/3.x (see refreshScriptList).
+        if (name.startsWith("/")) name.remove(0, 1);
+        if (!file.isDirectory() && name.startsWith("images_")) {
+            name.remove(0, 7);
             if (validImageFileName(name)) {
                 lua_pushstring(L, name.c_str());
                 lua_rawseti(L, -2, index++);
@@ -1773,6 +1934,143 @@ static int luaOnionSleep(lua_State* L) {
     return 0;
 }
 
+// ── Sound module (NS4168 amp + SPH0641 PDM mic) via I2S ─────────────────────
+// Pins are passed in from Lua so a script can sweep port variants (L1/L2/R)
+// without re-flashing. Errors return (false, msg) instead of aborting, so a
+// bad pin from a script can't crash the firmware.
+#define ONION_AUDIO_SR 16000
+
+// onion.tone(freq_hz, duration_ms, bclk, ws, sdo [, ctrl])
+//   plays a sine tone out the NS4168. Returns true on success, else (false,msg).
+static int luaOnionTone(lua_State* L) {
+    int freq = (int)luaL_checkinteger(L, 1);
+    int ms   = (int)luaL_checkinteger(L, 2);
+    int bclk = (int)luaL_checkinteger(L, 3);
+    int ws   = (int)luaL_checkinteger(L, 4);
+    int sdo  = (int)luaL_checkinteger(L, 5);
+    int ctrl = (int)luaL_optinteger(L, 6, -1);
+
+    if (freq < 50) freq = 50;
+    if (freq > 8000) freq = 8000;
+    if (ms < 1) ms = 1;
+    if (ms > 10000) ms = 10000;
+
+    pinMode(PIN_PWR, OUTPUT);
+    digitalWrite(PIN_PWR, HIGH);
+    if (ctrl >= 0) { pinMode(ctrl, OUTPUT); digitalWrite(ctrl, HIGH); }
+    delay(5);
+
+    i2s_chan_handle_t tx = nullptr;
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    if (i2s_new_channel(&chan_cfg, &tx, nullptr) != ESP_OK) {
+        lua_pushboolean(L, false); lua_pushstring(L, "i2s_new_channel failed"); return 2;
+    }
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(ONION_AUDIO_SR),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)bclk,
+            .ws   = (gpio_num_t)ws,
+            .dout = (gpio_num_t)sdo,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    if (i2s_channel_init_std_mode(tx, &std_cfg) != ESP_OK) {
+        i2s_del_channel(tx);
+        lua_pushboolean(L, false); lua_pushstring(L, "i2s init failed"); return 2;
+    }
+    i2s_channel_enable(tx);
+
+    const int period = ONION_AUDIO_SR / freq;
+    int16_t buf[256];
+    for (int i = 0; i < 256; i++) {
+        buf[i] = (int16_t)(0.30f * 32767.0f * sinf(2.0f * 3.14159265f * (i % period) / period));
+    }
+    size_t written;
+    uint32_t t0 = millis();
+    while ((uint32_t)(millis() - t0) < (uint32_t)ms) {
+        i2s_channel_write(tx, buf, sizeof(buf), &written, 100);
+    }
+
+    i2s_channel_disable(tx);
+    i2s_del_channel(tx);
+    if (ctrl >= 0) digitalWrite(ctrl, LOW);
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+// onion.mic_rms(duration_ms, bclk, ws, mic)
+//   samples the PDM mic for duration_ms; returns (rms, peak). A live mic gives
+//   a low floor that spikes when tapped; an unpowered/disconnected one rails.
+static int luaOnionMicRms(lua_State* L) {
+    int ms   = (int)luaL_checkinteger(L, 1);
+    int bclk = (int)luaL_checkinteger(L, 2);
+    int ws   = (int)luaL_checkinteger(L, 3);
+    int mic  = (int)luaL_checkinteger(L, 4);
+
+    if (ms < 1) ms = 1;
+    if (ms > 10000) ms = 10000;
+
+    pinMode(PIN_PWR, OUTPUT);
+    digitalWrite(PIN_PWR, HIGH);
+    // SPH0641 SELECT (= WS) tied LOW -> mic drives the LEFT slot we sample.
+    gpio_reset_pin((gpio_num_t)ws);
+    pinMode(ws, OUTPUT);
+    digitalWrite(ws, LOW);
+    delay(5);
+
+    i2s_chan_handle_t rx = nullptr;
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    if (i2s_new_channel(&chan_cfg, nullptr, &rx) != ESP_OK) {
+        lua_pushboolean(L, false); lua_pushstring(L, "i2s_new_channel failed"); return 2;
+    }
+    i2s_pdm_rx_config_t pdm_cfg = {
+        .clk_cfg  = I2S_PDM_RX_CLK_DEFAULT_CONFIG(ONION_AUDIO_SR),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                   I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = (gpio_num_t)bclk,
+            .din = (gpio_num_t)mic,
+            .invert_flags = { .clk_inv = false },
+        },
+    };
+    if (i2s_channel_init_pdm_rx_mode(rx, &pdm_cfg) != ESP_OK) {
+        i2s_del_channel(rx);
+        lua_pushboolean(L, false); lua_pushstring(L, "pdm init failed"); return 2;
+    }
+    i2s_channel_enable(rx);
+
+    static int16_t samples[1024];
+    size_t bytes_read;
+    double sumsq = 0;
+    long count = 0;
+    int peak = 0;
+    uint32_t t0 = millis();
+    while ((uint32_t)(millis() - t0) < (uint32_t)ms) {
+        if (i2s_channel_read(rx, samples, sizeof(samples), &bytes_read, 200) == ESP_OK) {
+            int n = bytes_read / sizeof(int16_t);
+            for (int i = 0; i < n; i++) {
+                int s = samples[i];
+                sumsq += (double)s * s;
+                if (abs(s) > peak) peak = abs(s);
+            }
+            count += n;
+        }
+    }
+
+    i2s_channel_disable(rx);
+    i2s_del_channel(rx);
+    gpio_reset_pin((gpio_num_t)ws);
+
+    double rms = count ? sqrt(sumsq / count) : 0;
+    lua_pushnumber(L, rms);
+    lua_pushinteger(L, peak);
+    return 2;
+}
+
 static int luaOnionGpioRead(lua_State* L) {
     int pin = (int)luaL_checkinteger(L, 1);
     if (!luaConfigureInputGpio(L, pin, 2)) return 2;
@@ -1822,6 +2120,26 @@ static void registerOnionLua(lua_State* L) {
     lua_setfield(L, -2, "wallet");
     lua_pushcfunction(L, luaOnionClearDisplay);
     lua_setfield(L, -2, "clear_display");
+    lua_pushcfunction(L, luaOnionShow);
+    lua_setfield(L, -2, "show");
+    lua_pushcfunction(L, luaOnionGfxClear);
+    lua_setfield(L, -2, "gfx_clear");
+    lua_pushcfunction(L, luaOnionGfxText);
+    lua_setfield(L, -2, "gfx_text");
+    lua_pushcfunction(L, luaOnionGfxRect);
+    lua_setfield(L, -2, "gfx_rect");
+    lua_pushcfunction(L, luaOnionGfxLine);
+    lua_setfield(L, -2, "gfx_line");
+    lua_pushcfunction(L, luaOnionGfxCircle);
+    lua_setfield(L, -2, "gfx_circle");
+    lua_pushcfunction(L, luaOnionGfxTriangle);
+    lua_setfield(L, -2, "gfx_triangle");
+    lua_pushcfunction(L, luaOnionGfxShow);
+    lua_setfield(L, -2, "gfx_show");
+    lua_pushcfunction(L, luaOnionKvGet);
+    lua_setfield(L, -2, "kv_get");
+    lua_pushcfunction(L, luaOnionKvSet);
+    lua_setfield(L, -2, "kv_set");
     lua_pushcfunction(L, luaOnionReleaseDisplay);
     lua_setfield(L, -2, "release_display");
     lua_pushcfunction(L, luaOnionDisplayBitmap);
@@ -1838,6 +2156,10 @@ static void registerOnionLua(lua_State* L) {
     lua_setfield(L, -2, "gpio_read");
     lua_pushcfunction(L, luaOnionGpioPoll);
     lua_setfield(L, -2, "gpio_poll");
+    lua_pushcfunction(L, luaOnionTone);
+    lua_setfield(L, -2, "tone");
+    lua_pushcfunction(L, luaOnionMicRms);
+    lua_setfield(L, -2, "mic_rms");
     lua_setglobal(L, "onion");
 }
 
