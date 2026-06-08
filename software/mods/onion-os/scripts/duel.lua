@@ -9,6 +9,47 @@
 
 onion.log("ESP-Duel start")
 
+-- ── Upstream-firmware compatibility shim ──────────────────────────────────────
+-- This game was written against the old gfx_* Lua API. Upstream onion-os exposes
+-- the same drawing on a canvas via display_*. These shims re-create gfx_* on top
+-- of display_*, so all the game logic below is unchanged:
+--   * gfx_clear()  -> display_begin() + wipe the canvas to white (deferred frame)
+--   * gfx_show()   -> display_commit() (paints the batched frame in one refresh)
+--   * gfx_text size 2 -> "large" font (FreeMonoBold18pt); else "small" (FreeMono9pt)
+-- Drawing is batched between gfx_clear and gfx_show into a single e-ink refresh.
+-- If you ever run this on firmware with native gfx_*, delete this block.
+if not onion.display_begin then
+  error("ESP-Duel needs the onion-os display_* API (upstream firmware)")
+end
+do
+  function onion.gfx_clear()
+    onion.display_begin()                            -- defer refresh until gfx_show()
+    onion.display_text("", 0, 0, { clear = true })   -- wipe canvas to white
+  end
+  function onion.gfx_text(x, y, str, size, white)
+    onion.display_text(str, x, y, {
+      clear = false,
+      font  = (size and size >= 2) and "large" or "small",
+      color = white and "white" or "black",
+    })
+  end
+  function onion.gfx_rect(x, y, w, h, fill)
+    onion.display_rect(x, y, w, h, { fill = fill and true or false })
+  end
+  function onion.gfx_line(x0, y0, x1, y1)
+    onion.display_line(x0, y0, x1, y1)
+  end
+  function onion.gfx_circle(cx, cy, r, fill)
+    onion.display_circle(cx, cy, r, { fill = fill and true or false })
+  end
+  function onion.gfx_triangle(x0, y0, x1, y1, x2, y2, fill)
+    onion.display_triangle(x0, y0, x1, y1, x2, y2, { fill = fill and true or false })
+  end
+  function onion.gfx_show()
+    onion.display_commit()                           -- render the batched frame
+  end
+end
+
 local W, H = 264, 176
 
 -- dmg[you][opp] = { hp you lose, hp opponent loses }
