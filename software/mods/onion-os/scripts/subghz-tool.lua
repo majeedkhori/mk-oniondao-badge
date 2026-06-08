@@ -22,6 +22,8 @@ if not onion.subghz_begin then
   error("OnionGHz needs the onion-os subghz_* API (upstream firmware)")
 end
 local HAS_RSSI = onion.subghz_rssi ~= nil
+local HAS_RAW  = onion.subghz_raw_record ~= nil   -- record/replay raw OOK signals
+local RAW_SLOT = "garage"                          -- saved-signal name
 
 -- Radio is on the LEFT port = variant L1 (verified by subghz-test).
 local PINS = { mosi = 48, sck = 47, cs = 19, miso = 42, gdo0 = 41 }
@@ -62,10 +64,10 @@ local function draw(title, lines, footer)
   onion.display_begin()
   onion.display_text(title, 6, 16, { clear = true, font = "bold" })
   onion.display_line(0, 22, W, 22)
-  local y = 38
+  local y = 36
   for _, ln in ipairs(lines) do
     onion.display_text(ln, 6, y, { clear = false })
-    y = y + 15
+    y = y + 14
   end
   if footer then onion.display_text(footer, 6, H - 6, { clear = false }) end
   onion.display_commit()
@@ -204,6 +206,75 @@ local function mode_find()
   read_key()
 end
 
+-- ── copy & replay raw OOK (needs subghz_raw_*) ───────────────────────────────
+-- Records a fixed-code remote's raw signal and replays it. Rolling-code systems
+-- (most modern garage openers) reject a replay by design — this is for fixed-code
+-- remotes on equipment you own. Set the right frequency first (use Find Signal).
+local function mode_copy()
+  local captured = false
+  local last = ""
+  -- auto-load a previously saved signal so you can replay after a reboot
+  local lok = onion.subghz_raw_load(RAW_SLOT)
+  if lok then captured = true; last = "loaded '" .. RAW_SLOT .. "'" end
+
+  local function status(msg)
+    local edges = (onion.subghz_raw_info() or {}).edges or 0
+    draw("COPY SIGNAL", {
+      string.format("Freq %.3f MHz (OOK)", freq()),
+      "LEFT/RIGHT change freq",
+      "",
+      captured and string.format("captured: %d edges", edges) or "nothing captured",
+      msg or "",
+      "",
+      "SEL rec  UP send  DN save",
+    }, "CANCEL = back")
+  end
+  status(last)
+
+  while true do
+    local k = read_key()
+    if k == "cancel" then
+      radio_start()          -- restore packet mode for the other tools
+      return
+    elseif k == "left" then
+      fi = (fi - 2) % #FREQS + 1; onion.subghz_set_frequency(freq()); status()
+    elseif k == "right" then
+      fi = fi % #FREQS + 1; onion.subghz_set_frequency(freq()); status()
+    elseif k == "select" then
+      onion.subghz_set_frequency(freq())
+      draw("COPY SIGNAL", {
+        string.format("Freq %.3f MHz", freq()), "",
+        "RECORDING (5s)...", "hold the remote", "button down NOW",
+      }, "")
+      local res, err = onion.subghz_raw_record(5000, -78)
+      if res then
+        captured = true
+        status(string.format("got %d edges %d-%dus", res.edges, res.min_us, res.max_us))
+      else
+        status("no signal (" .. tostring(err) .. ")")
+      end
+    elseif k == "up" then
+      if captured then
+        draw("COPY SIGNAL", {
+          string.format("Freq %.3f MHz", freq()), "",
+          "TRANSMITTING...", "(replaying x6)",
+        }, "")
+        onion.subghz_raw_replay(6, 25)
+        status("sent")
+      else
+        status("record something first")
+      end
+    elseif k == "down" then
+      if captured then
+        local ok = onion.subghz_raw_save(RAW_SLOT)
+        status(ok and ("saved as '" .. RAW_SLOT .. "'") or "save failed")
+      else
+        status("nothing to save")
+      end
+    end
+  end
+end
+
 -- ── settings / info ──────────────────────────────────────────────────────────
 local function mode_set_freq()
   while true do
@@ -259,6 +330,7 @@ local ITEMS = {
   { "RSSI meter",      HAS_RSSI and mode_rssi },
   { "Spectrum",        HAS_RSSI and mode_spectrum },
   { "Find Signal",     HAS_RSSI and mode_find },
+  { "Copy signal",     HAS_RAW and mode_copy },
   { "Frequency",       mode_set_freq },
   { "Modulation",      mode_set_mod },
   { "Radio info",      mode_info },
