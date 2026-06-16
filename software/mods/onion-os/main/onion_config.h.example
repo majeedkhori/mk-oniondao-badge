@@ -7,7 +7,7 @@
 
 // The firmware ignores this for runtime API calls and uses https://oniondao.dev.
 #define ONION_DEFAULT_SERVER_BASE_URL "https://oniondao.dev"
-#define ONION_DEFAULT_BADGE_API_KEY ""
+#define ONION_DEFAULT_BADGE_API_KEY "02eb3d5e04fd2dc9cbb6f3f5c6c9d89d9c96acd987cc24ddf9f717f9480e8786"
 
 // The firmware ignores this for runtime MQTT calls and uses
 // mqtt://shortline.proxy.rlwy.net:20928.
