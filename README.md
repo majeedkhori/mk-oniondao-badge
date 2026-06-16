@@ -15,6 +15,27 @@ outputs, STEP model) lives in [`pcb/`](pcb). The software lives in
 
 ---
 
+> ### 👋 This is my personal build of the OnionDAO badge — Majeed Khori
+>
+> The badge **hardware** and the core **Onion OS** platform are by the
+> [OnionDAO team](https://github.com/OnionDAO-git/oniondao-badge). On top of them
+> I built:
+>
+> - **[ESP-Duel](MODS.md#1-esp-duel--a-wireless-dueling-game-with-cryptographic-fair-play)** —
+>   a 1-v-1 wireless game with a cryptographic commit–reveal protocol and
+>   hardware-signed moves (ATECC608B), playable badge-vs-badge or vs CPU.
+> - **[Sub-GHz CC1101 toolkit](MODS.md#2-sub-ghz-cc1101-radio-toolkit)** — a
+>   Flipper-style 433/315/868/915 MHz multitool: RF spectrum/find-signal meter
+>   and raw OOK record-replay for fixed-code remotes.
+> - **[Onion OS apps & bindings](MODS.md#3-onion-os-apps--bindings)** —
+>   Tic-Tac-Toe, an ID-card app, and audio/graphics/storage Lua bindings.
+>
+> **➡️ Full write-up & credits: [MODS.md](MODS.md).**
+> **Want to play?** Flash the [prebuilt image](software/mods/onion-os/prebuilt)
+> (`esptool` only, no toolchain) and open **Scripts → duel**.
+
+---
+
 ## Table of Contents
 
 - [At a Glance](#at-a-glance)

@@ -7,6 +7,12 @@ BAUD="${BAUD:-460800}"
 PORT="${PORT:-}"
 MONITOR=0
 ERASE=0
+SCRIPTS=0
+
+# SPIFFS partition geometry — must match ../partitions.csv
+# (spiffs, data, spiffs, 0x670000, 0x180000).
+SPIFFS_OFFSET=0x670000
+SPIFFS_SIZE=1572864   # 0x180000
 
 usage() {
   cat <<'EOF'
@@ -17,6 +23,8 @@ Build Onion OS and flash it to the first available ESP32-S3 serial board.
 Options:
   -p, --port PORT    Flash a specific serial port instead of auto-detecting
   -b, --baud BAUD    Flash baud rate (default: 460800, or $BAUD)
+  --scripts          Also bundle the Lua apps in scripts/ into a SPIFFS image
+                     and flash it (so ESP-Duel et al. are ready on the badge).
   --erase            Erase flash before flashing
   --monitor          Open idf.py monitor after flashing
   -h, --help         Show this help
@@ -39,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 2; }
       BAUD="$2"
       shift 2
+      ;;
+    --scripts)
+      SCRIPTS=1
+      shift
       ;;
     --erase)
       ERASE=1
@@ -192,8 +204,50 @@ if [[ "$ERASE" -eq 1 ]]; then
   idf.py -p "$PORT" -b "$BAUD" erase-flash
 fi
 
+# Flash the application first (no monitor yet — we may still flash SPIFFS below).
+idf.py -p "$PORT" -b "$BAUD" flash
+
+# --scripts: pack every scripts/*.lua into a SPIFFS image and flash it to the
+# spiffs partition so the badge's Scripts menu can run them (ESP-Duel included).
+# The firmware lists files named "scripts_<name>.lua", so we stage with that
+# prefix before generating the image.
+if [[ "$SCRIPTS" -eq 1 ]]; then
+  SCRIPTS_DIR="$PROJECT_DIR/scripts"
+  SPIFFSGEN="${IDF_PATH:-}/components/spiffs/spiffsgen.py"
+  if [[ ! -f "$SPIFFSGEN" ]]; then
+    echo "spiffsgen.py not found at $SPIFFSGEN (is ESP-IDF sourced?)" >&2
+    exit 1
+  fi
+
+  STAGE="$(mktemp -d)"
+  IMG="$(mktemp -t onion-spiffs.XXXXXX.bin)"
+  trap 'rm -rf "$STAGE" "$IMG"' EXIT
+
+  shopt -s nullglob
+  count=0
+  for lua in "$SCRIPTS_DIR"/*.lua; do
+    base="$(basename "$lua")"
+    cp "$lua" "$STAGE/scripts_${base}"
+    count=$((count + 1))
+  done
+  shopt -u nullglob
+  if [[ "$count" -eq 0 ]]; then
+    echo "No .lua files found in $SCRIPTS_DIR" >&2
+    exit 1
+  fi
+  echo "Packing $count Lua app(s) into a ${SPIFFS_SIZE}-byte SPIFFS image..."
+
+  python "$SPIFFSGEN" "$SPIFFS_SIZE" "$STAGE" "$IMG" \
+    --page-size 256 --obj-name-len 32 --meta-len 4 --use-magic --use-magic-len
+
+  echo "Flashing SPIFFS image to $SPIFFS_OFFSET..."
+  "$ESPTOOL" --chip "$TARGET" -p "$PORT" -b "$BAUD" \
+    --before default_reset --after hard_reset \
+    write_flash "$SPIFFS_OFFSET" "$IMG"
+
+  echo "Done. On the badge: open the Scripts menu and pick 'duel' to play ESP-Duel vs CPU."
+fi
+
 if [[ "$MONITOR" -eq 1 ]]; then
-  idf.py -p "$PORT" -b "$BAUD" flash monitor
-else
-  idf.py -p "$PORT" -b "$BAUD" flash
+  idf.py -p "$PORT" -b "$BAUD" monitor
 fi
